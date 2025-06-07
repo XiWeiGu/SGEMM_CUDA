@@ -7,6 +7,14 @@
 // 向上取整除法
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
+#define BLOCK_M 32
+#define BLOCK_N 32
+
+#define BLOCK_Y 32
+#define BLOCK_X 32
+
+#define WARP_SIZE 32
+
 // 检查CUDA错误
 #define CHECK_CUDA_ERROR(call) do { \
     cudaError_t err = call; \
@@ -19,10 +27,43 @@
 // 朴素的SGEMM内核实现
 __global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
                             const float *B, float beta, float *C) {
+  // 从高层次==>低层次, groupRow  ==>  warpRow ==> threadRow
   // 计算当前线程负责的C矩阵位置
-  const uint x = blockIdx.y * blockDim.y + threadIdx.y;
-  const uint y = blockIdx.x * blockDim.x + threadIdx.x;
+  //const uint x = blockIdx.y * blockDim.y + threadIdx.y;
+  //const uint y = blockIdx.x * blockDim.x + threadIdx.x;
 
+  // Group Global Idx
+  const uint groupRow = blockIdx.y * BLOCK_M;
+  const uint groupCol = blockIdx.x * BLOCK_N;
+
+  // warp/lane ID
+  const uint warpId = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
+  const uint laneId = (threadIdx.y * blockDim.x + threadIdx.x) % WARP_SIZE;
+
+  // 每个warp需要处理BLOCK的大小
+  const uint warp_block = (BLOCK_N * BLOCK_M) /  WARP_SIZE;
+  // 假设warap_block=32=WAP_SIZE, 表示每个线程取一个A,B;
+  //const uint thread_read_size = warp_block / WARP_SIZE;
+  uint warp_block_m = 8;
+  uint warp_block_n;
+  //for (; warp_block_m <= warp_block; warp_block_m =<< 1) {
+  warp_block_n = warp_block / warp_block_m;
+  //const uint warpRow = warpId % (BLOCK_M / warp_block_m) * warp_block_m;
+  //const uint warpCol = warpId % (BLOCK_N / warp_block_n) * warp_block_n;
+  const uint warpRow = (warpId / warp_block_m) * warp_block_m;
+  const uint warpCol = (warpId % warp_block_m) * warp_block_n;
+  //printf("warpId: %d warpRow: %d warpCol: %d \n", warpId, warpRow, warpCol);
+  int threadRow = groupRow + warpRow + laneId / warp_block_n;
+  int threadCol = groupCol + warpCol + laneId % warp_block_n;
+  float tmp = 0.0f;
+  for (int i = 0; i < K; i++) {
+    tmp += A[threadRow * K + i] * B[i * N + threadCol];
+  }
+  // C = α*(A@B)+β*C
+  C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol];
+  //}
+
+#if 0
   // 边界检查（处理M或N不是32的倍数的情况）
   if (x < M && y < N) {
     float tmp = 0.0f;
@@ -32,6 +73,7 @@ __global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
     // C = α*(A@B)+β*C
     C[x * N + y] = alpha * tmp + beta * C[x * N + y];
   }
+#endif
 }
 
 // CPU端矩阵乘法实现（用于结果校验）
@@ -107,9 +149,9 @@ int main() {
   CHECK_CUDA_ERROR(cudaMemcpy(d_C, h_C_gpu, size_C, cudaMemcpyHostToDevice));
   
   // 设置内核启动参数
-  dim3 gridDim(CEIL_DIV(N, 32), CEIL_DIV(M, 32), 1);
+  dim3 gridDim(CEIL_DIV(N, BLOCK_M), CEIL_DIV(M, BLOCK_N), 1);
   //dim3 blockDim(32, 32, 1);
-  dim3 blockDim(8, 128, 1);
+  dim3 blockDim(BLOCK_Y, BLOCK_X, 1);
   
   // 预热CUDA上下文
   sgemm_naive<<<gridDim, blockDim>>>(M, N, K, 1.0f, d_A, d_B, 0.0f, d_C);
@@ -152,6 +194,25 @@ int main() {
   // 验证结果
   bool correct = verify_results(M, N, h_C_gpu, h_C_cpu);
   printf("Validation: %s\n", correct ? "PASSED" : "FAILED");
+
+  // 输出结果
+ // for (int i = 0; i < M; ++i) {
+ //   for (int j = 0; j < N; ++j) {
+ //     int idx = i * N + j;
+ //     printf("%f, ", h_C_gpu[idx]);
+ //   }
+ //   printf("\n");
+ // }
+ // printf("\n");
+
+ // for (int i = 0; i < M; ++i) {
+ //   for (int j = 0; j < N; ++j) {
+ //     int idx = i * N + j;
+ //     printf("%f, ", h_C_cpu[idx]);
+ //   }
+ //   printf("\n");
+ // }
+ // printf("\n");
   
   // 清理资源
   CHECK_CUDA_ERROR(cudaEventDestroy(start));
